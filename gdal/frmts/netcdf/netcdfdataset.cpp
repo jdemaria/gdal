@@ -43,6 +43,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10783,68 +10784,108 @@ static CPLErr NCDFGetRootGroup( int nStartGroupId, int *pnRootGroupId )
     return CE_None;
 }
 
-// Implementation of NCDFResolveVar/Att recursions.
-static CPLErr NCDFResolveRec( int nStartGroupId,
-                              const char *pszVar, const char *pszAtt,
-                              int *pnGroupId, int *pnId, bool bMandatory )
+// Implementation of NCDFResolveVar/Att.
+static CPLErr NCDFResolveElem( int nStartGroupId,
+                               const char *pszVar, const char *pszAtt,
+                               int *pnGroupId, int *pnId, bool bMandatory )
 {
-    int status;
-    if( pszVar != nullptr )
-        status = nc_inq_varid(*pnGroupId, pszVar, pnId);
-    else // pszAtt != nullptr.
-        status = nc_inq_attid(*pnGroupId, NC_GLOBAL, pszAtt, pnId);
+    enum {NCRM_PARENT, NCRM_WIDTH_WISE} eNCResolveMode = NCRM_PARENT;
 
-    if( status == NC_NOERR )
+    std::queue<int> aoQueueGroupIdsToVisit;
+    aoQueueGroupIdsToVisit.push(nStartGroupId);
+
+    while( !aoQueueGroupIdsToVisit.empty() )
     {
-        return CE_None;
-    } else if( (pszVar != nullptr && status != NC_ENOTVAR)
-               || (pszAtt != nullptr && status != NC_ENOTATT) )
-    {
-        NCDF_ERR_RET(status);
-    }
-    else // Var or att not found.
-    {
+        // Get the first group of the FIFO queue.
+        *pnGroupId = aoQueueGroupIdsToVisit.front();
+        aoQueueGroupIdsToVisit.pop();
+
+        // Look if this group contains the searched element.
+        int status;
+        if( pszVar != nullptr )
+            status = nc_inq_varid(*pnGroupId, pszVar, pnId);
+        else // pszAtt != nullptr.
+            status = nc_inq_attid(*pnGroupId, NC_GLOBAL, pszAtt, pnId);
+
+        if( status == NC_NOERR )
+        {
+            return CE_None;
+        }
+        else if( (pszVar != nullptr && status != NC_ENOTVAR) ||
+                 (pszAtt != nullptr && status != NC_ENOTATT) )
+        {
+            NCDF_ERR_RET(status);
+        }
 #ifdef NETCDF_HAS_NC4
-        // Recurse on parent group.
-        int status2 = nc_inq_grp_parent(*pnGroupId, pnGroupId);
-        if( status2 == NC_NOERR )
+        // Element not found, in NC4 case we must search in other groups
+        // following the CF logic.
+        else
         {
-            return NCDFResolveRec(nStartGroupId, pszVar, pszAtt,
-                                  pnGroupId, pnId, bMandatory);
-        }
-        else if( status2 != NC_ENOGRP )
-        {
-            NCDF_ERR_RET(status2);
-        }
-        else // No more parent group.
-#endif
-        {
-            if( bMandatory )
+            // The first resolve mode consists to search on parent groups.
+            if( eNCResolveMode == NCRM_PARENT )
             {
-                char *pszStartGroupFullName;
-                NCDFGetGroupFullName(nStartGroupId, &pszStartGroupFullName);
-                CPLError(CE_Failure, CPLE_AppDefined,
-                         "Cannot resolve mandatory %s %s from group %s",
-                         (pszVar != nullptr ? pszVar : pszAtt),
-                         (pszVar != nullptr ? "variable" : "attribute"),
-                         pszStartGroupFullName);
-                CPLFree(pszStartGroupFullName);
+                int nParentGroupId;
+                int status2 = nc_inq_grp_parent(*pnGroupId, &nParentGroupId);
+                if( status2 == NC_NOERR )
+                    aoQueueGroupIdsToVisit.push(nParentGroupId);
+                else if( status2 != NC_ENOGRP )
+                    NCDF_ERR_RET(status2);
+                else if( pszVar != nullptr )
+                    // When resolving a variable, if there is no more
+                    // parent group then we switch to width-wise search mode
+                    // starting from the latest found parent group.
+                    eNCResolveMode = NCRM_WIDTH_WISE;
             }
-            return CE_Failure;
+
+            // The second resolve mode is a width-wise search.
+            if( eNCResolveMode == NCRM_WIDTH_WISE )
+            {
+                // Enqueue all direct sub-groups.
+                int nSubGroups, *panSubGroupIds = nullptr;
+                ERR_RET(NCDFGetSubGroups(*pnGroupId,
+                        &nSubGroups, &panSubGroupIds));
+                for( int i = 0; i < nSubGroups; i++ )
+                    aoQueueGroupIdsToVisit.push(panSubGroupIds[i]);
+                CPLFree(panSubGroupIds);
+            }
         }
+#endif
     }
 
-    return CE_None;
+    if( bMandatory )
+    {
+        char *pszStartGroupFullName;
+        NCDFGetGroupFullName(nStartGroupId, &pszStartGroupFullName);
+        CPLError(CE_Failure, CPLE_AppDefined,
+                "Cannot resolve mandatory %s %s from group %s",
+                (pszVar != nullptr ? pszVar : pszAtt),
+                (pszVar != nullptr ? "variable" : "attribute"),
+                pszStartGroupFullName);
+        CPLFree(pszStartGroupFullName);
+    }
+
+    return CE_Failure;
 }
 
-// Resolve a variable name recursively in a given starting group and its
-// parents.
-// If var name is an absolute path then directly open it.
+// Resolve a variable name from a given starting group following the CF logic:
+// - if var name is an absolute path then directly open it
+// - first search in the starting group and its parent groups
+// - then if there is no more parent group we switch to a width-wise search
+//   mode starting from the latest found parent group.
+// The full CF logic is described here:
+// https://github.com/diwg/cf2/blob/master/group/cf2-group.adoc#scope
 // If bMandatory then print an error if resolving fails.
-// TODO: if needed we could implement support of relative paths.
-// TODO: if needed we could implement support for "lateral search" like
-//       currently discussed by CF team:
-//       https://github.com/cf-convention/cf-conventions/issues/144#issuecomment-425252364
+// TODO: implement support of relative paths.
+// TODO: to follow strictly the CF logic, when searching for a coordinate
+//       variable, we must stop the parent search mode once the corresponding
+//       dimension is found and start the width-wise search from this group.
+// TODO: to follow strictly the CF logic, when searching in width-wise mode
+//       we should skip every groups already visited during the parent
+//       search mode (but revisiting them should have no impact so we could
+//       let as it is if it is simpler...)
+// TODO: CF specifies that the width-wise search order is "left-to-right" so
+//       maybe we must sort sibling groups alphabetically? but maybe not
+//       necessary if nc_inq_grps() already sort them?
 static CPLErr NCDFResolveVar( int nStartGroupId, const char *pszVar,
                               int *pnGroupId, int *pnVarId,
                               bool bMandatory )
@@ -10859,9 +10900,9 @@ static CPLErr NCDFResolveVar( int nStartGroupId, const char *pszVar,
     }
     else
     {
-        // We have to search the variable on current and parent groups.
-        ERR_RET(NCDFResolveRec(nStartGroupId, pszVar, nullptr,
-                               &nGroupId, &nVarId, bMandatory));
+        // We have to search the variable following the CF logic.
+        ERR_RET(NCDFResolveElem(nStartGroupId, pszVar, nullptr,
+                                &nGroupId, &nVarId, bMandatory));
     }
     *pnGroupId = nGroupId;
     *pnVarId = nVarId;
@@ -10887,8 +10928,8 @@ static CPLErr NCDFResolveAttInt( int nStartGroupId, int nStartVarId,
                                  bool bMandatory )
 {
     int nGroupId = nStartGroupId, nAttId = nStartVarId;
-    ERR_RET(NCDFResolveRec(nStartGroupId, nullptr, pszAtt,
-                           &nGroupId, &nAttId, bMandatory));
+    ERR_RET(NCDFResolveElem(nStartGroupId, nullptr, pszAtt,
+                            &nGroupId, &nAttId, bMandatory));
     NCDF_ERR_RET(nc_get_att_int(nGroupId, NC_GLOBAL, pszAtt, pnAtt));
     return CE_None;
 }
