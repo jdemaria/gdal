@@ -124,8 +124,8 @@ static CPLErr NCDFOpenSubDataset( int nCdfId, const char *pszSubdatasetName,
                                   int *pnGroupId, int *pnVarId );
 static CPLErr NCDFGetVisibleDims( int nGroupId, int *pnDims,
                                   int **ppanDimIds );
-static CPLErr NCDFGetNestedGroups( int nGroupId, int *pnNestedGroups,
-                                   int **ppanNestedGroupIds );
+static CPLErr NCDFGetSubGroups( int nGroupId, int *pnSubGroups,
+                                int **ppanSubGroupIds );
 static CPLErr NCDFGetGroupFullName( int nGroupId, char **ppszFullName,
                                     bool bNC3Compat=true );
 static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
@@ -4897,9 +4897,9 @@ CPLErr netCDFDataset::ReadAttributes( int cdfidIn, int var)
 
     if( var == NC_GLOBAL )
     {
-        // Recurse on nested groups.
+        // Recurse on sub-groups.
         int nSubGroups, *panSubGroupIds = nullptr;
-        ERR_RET(NCDFGetNestedGroups(cdfidIn, &nSubGroups, &panSubGroupIds));
+        ERR_RET(NCDFGetSubGroups(cdfidIn, &nSubGroups, &panSubGroupIds));
         for( int i = 0; i < nSubGroups; i++ )
         {
             ERR_RET(ReadAttributes(panSubGroupIds[i], var));
@@ -5029,9 +5029,9 @@ void netCDFDataset::CreateSubDatasetList( int nGroupId )
         }
     }
 
-    // Recurse on nested groups.
+    // Recurse on sub groups.
     int nSubGroups, *panSubGroupIds = nullptr;
-    NCDFGetNestedGroups(nGroupId, &nSubGroups, &panSubGroupIds);
+    NCDFGetSubGroups(nGroupId, &nSubGroups, &panSubGroupIds);
     for( int i = 0; i < nSubGroups; i++ )
     {
         CreateSubDatasetList(panSubGroupIds[i]);
@@ -10684,21 +10684,21 @@ static CPLErr NCDFGetVisibleDims( int nGroupId, int *pnDims,
     return CE_None;
 }
 
-// Get all nested groups IDs of a given NetCDF (or group) ID.
+// Get direct sub-groups IDs of a given NetCDF (or group) ID.
 // Consider only direct childs, does not get childs of childs.
-static CPLErr NCDFGetNestedGroups( int nGroupId, int *pnNestedGroups,
-                                   int **ppanNestedGroupIds )
+static CPLErr NCDFGetSubGroups( int nGroupId, int *pnSubGroups,
+                                  int **ppanSubGroupIds )
 {
-    *pnNestedGroups = 0;
-    *ppanNestedGroupIds = nullptr;
+    *pnSubGroups = 0;
+    *ppanSubGroupIds = nullptr;
 
 #ifdef NETCDF_HAS_NC4
     int nSubGroups;
     NCDF_ERR_RET(nc_inq_grps(nGroupId, &nSubGroups, nullptr));
     int *panSubGroupIds = (int *) CPLMalloc(nSubGroups * sizeof(int));
     NCDF_ERR_RET(nc_inq_grps(nGroupId, nullptr, panSubGroupIds));
-    *pnNestedGroups = nSubGroups;
-    *ppanNestedGroupIds = panSubGroupIds;
+    *pnSubGroups = nSubGroups;
+    *ppanSubGroupIds = panSubGroupIds;
 #endif
 
     return CE_None;
@@ -10927,9 +10927,9 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
         }
     }
 
-    // Recurse on nested groups.
+    // Recurse on sub-groups.
     int nSubGroups, *panSubGroupIds = nullptr;
-    ERR_RET(NCDFGetNestedGroups(nCdfId, &nSubGroups, &panSubGroupIds));
+    ERR_RET(NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds));
     for( int i = 0; i < nSubGroups; i++ )
     {
         ERR_RET(NCDFFilterRasterVarsRec(panSubGroupIds[i], papszIgnoredVars,
@@ -10942,7 +10942,7 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
 }
 
 // Filter raster variables (2+D non coordinate or boundary variables) in
-// a given a NetCDF (or group) ID and its nested groups.
+// a given a NetCDF (or group) ID and its sub-groups.
 static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
                                     int *pnVarId, int *pnIgnoredVars )
 {
@@ -10961,7 +10961,7 @@ static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
 }
 
 // Get all coordinate and boundary variables full names referenced in
-// a given a NetCDF (or group) ID and its nested groups.
+// a given a NetCDF (or group) ID and its sub-groups.
 // These variables are identified in other variable's
 // "coordinates" and "bounds" attribute.
 // Searching coordinate and boundary variables may need to explore
@@ -10997,9 +10997,9 @@ static CPLErr NCDFGetCoordAndBoundVarFullNames( int nCdfId,
         CSLDestroy(papszTokens);
     }
 
-    // Recurse on nested groups.
+    // Recurse on sub-groups.
     int nSubGroups, *panSubGroupIds = nullptr;
-    ERR_RET(NCDFGetNestedGroups(nCdfId, &nSubGroups, &panSubGroupIds));
+    ERR_RET(NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds));
     for( int i = 0; i < nSubGroups; i++ )
     {
         ERR_RET(NCDFGetCoordAndBoundVarFullNames(panSubGroupIds[i],
