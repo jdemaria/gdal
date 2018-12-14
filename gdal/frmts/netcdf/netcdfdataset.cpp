@@ -2265,7 +2265,7 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
     if( !EQUAL(szGridMappingValue, "") )
     {
         // Read grid_mapping metadata.
-        int nProjGroupID, nProjVarID;
+        int nProjGroupID = -1, nProjVarID = -1;
         if( NCDFResolveVar(nGroupId, szGridMappingValue,
                            &nProjGroupID, &nProjVarID) == CE_None )
         {
@@ -4869,7 +4869,7 @@ CPLErr netCDFDataset::ReadAttributes( int cdfidIn, int var)
     char *pszMetaName = (char *) CPLMalloc(nMetaNameSize);
 
     int nbAttr = 0;
-    NCDF_ERR_RET(nc_inq_varnatts(cdfidIn, var, &nbAttr));
+    NCDF_ERR(nc_inq_varnatts(cdfidIn, var, &nbAttr));
 
     for( int l = 0; l < nbAttr; l++ )
     {
@@ -4899,11 +4899,11 @@ CPLErr netCDFDataset::ReadAttributes( int cdfidIn, int var)
     if( var == NC_GLOBAL )
     {
         // Recurse on sub-groups.
-        int nSubGroups, *panSubGroupIds = nullptr;
-        ERR_RET(NCDFGetSubGroups(cdfidIn, &nSubGroups, &panSubGroupIds));
+        int nSubGroups = 0, *panSubGroupIds = nullptr;
+        NCDFGetSubGroups(cdfidIn, &nSubGroups, &panSubGroupIds);
         for( int i = 0; i < nSubGroups; i++ )
         {
-            ERR_RET(ReadAttributes(panSubGroupIds[i], var));
+            ReadAttributes(panSubGroupIds[i], var);
         }
         CPLFree(panSubGroupIds);
     }
@@ -4945,6 +4945,7 @@ void netCDFDataset::CreateSubDatasetList( int nGroupId )
                 nc_inq_dimlen(nGroupId, ponDimIds[i], &nDimLen);
                 osDim += CPLSPrintf("%dx", (int)nDimLen);
             }
+            CPLFree(ponDimIds);
 
             nc_type nVarType;
             nc_inq_vartype(nGroupId, nVar, &nVarType);
@@ -4992,10 +4993,11 @@ void netCDFDataset::CreateSubDatasetList( int nGroupId )
                 break;
             }
 
-            nSubDatasets++;
-
             char *pszName = nullptr;
-            NCDFGetVarFullName(nGroupId, nVar, &pszName);
+            if( NCDFGetVarFullName(nGroupId, nVar, &pszName) != CE_None )
+                continue;
+
+            nSubDatasets++;
 
             nAttlen = 0;
             nc_inq_att(nGroupId, nVar, CF_STD_NAME, &nAttype, &nAttlen);
@@ -5025,13 +5027,11 @@ void netCDFDataset::CreateSubDatasetList( int nGroupId )
                 CSLSetNameValue(poDS->papszSubDatasets, szTemp,
                                 CPLSPrintf("[%s] %s (%s)", osDim.c_str(),
                                            szVarStdName, pszType));
-
-            CPLFree(ponDimIds);
         }
     }
 
     // Recurse on sub groups.
-    int nSubGroups, *panSubGroupIds = nullptr;
+    int nSubGroups = 0, *panSubGroupIds = nullptr;
     NCDFGetSubGroups(nGroupId, &nSubGroups, &panSubGroupIds);
     for( int i = 0; i < nSubGroups; i++ )
     {
@@ -7670,7 +7670,7 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
     // in NetCDF-3 because we see only the dimensions of the selected group
     // and its parents.
     // poDS->papszDimName is indexed by dim IDs, so it must contains all IDs
-    // [0..max(panDimIds)], but they are not all usefull so we fill names
+    // [0..max(panDimIds)], but they are not all useful so we fill names
     // of useless dims with empty string.
     int nMaxDimId = -1;
     for( int i = 0; i < ndims; i++ )
@@ -7687,7 +7687,7 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
         }
         if( i < ndims )
         {
-            // Usefull dim.
+            // Useful dim.
             char szTemp[NC_MAX_NAME + 1] = {};
             status = nc_inq_dimname(cdfid, panDimIds[i], szTemp);
             if( status != NC_NOERR )
@@ -7702,7 +7702,7 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
                 return nullptr;
             }
             poDS->papszDimName.AddString(szTemp);
-            int nDimGroupId, nDimVarId;
+            int nDimGroupId = -1, nDimVarId = -1;
             if( NCDFResolveVar(cdfid, poDS->papszDimName[j],
                                &nDimGroupId, &nDimVarId) == CE_None )
             {
@@ -10625,6 +10625,9 @@ static char **NCDFTokenizeArray( const char *pszValue )
 static CPLErr NCDFOpenSubDataset( int nCdfId, const char *pszSubdatasetName,
                                   int *pnGroupId, int *pnVarId )
 {
+    *pnGroupId = -1;
+    *pnVarId = -1;
+
     // Open group.
     char *pszGroupFullName = CPLStrdup(CPLGetPath(pszSubdatasetName));
     // Add a leading slash if needed.
@@ -10661,7 +10664,7 @@ static CPLErr NCDFOpenSubDataset( int nCdfId, const char *pszSubdatasetName,
 static CPLErr NCDFGetVisibleDims( int nGroupId, int *pnDims,
                                   int **ppanDimIds )
 {
-    int nDims, *panDimIds = nullptr;
+    int nDims = 0, *panDimIds = nullptr;
 #ifdef NETCDF_HAS_NC4
     NCDF_ERR_RET(nc_inq_dimids(nGroupId, &nDims, nullptr, true));
 #else
@@ -10671,7 +10674,10 @@ static CPLErr NCDFGetVisibleDims( int nGroupId, int *pnDims,
     panDimIds = (int *) CPLMalloc(nDims * sizeof(int));
 
 #ifdef NETCDF_HAS_NC4
-    NCDF_ERR_RET(nc_inq_dimids(nGroupId, nullptr, panDimIds, true));
+    int status = nc_inq_dimids(nGroupId, nullptr, panDimIds, true);
+    if( status != NC_NOERR )
+        CPLFree(panDimIds);
+    NCDF_ERR_RET(status);
 #else
     for( int i = 0; i < nDims; i++ )
     {
@@ -10712,6 +10718,8 @@ static CPLErr NCDFGetSubGroups( int nGroupId, int *pnSubGroups,
 static CPLErr NCDFGetGroupFullName( int nGroupId, char **ppszFullName,
                                     bool bNC3Compat )
 {
+    *ppszFullName = nullptr;
+
 #ifdef NETCDF_HAS_NC4
     size_t nFullNameLen;
     NCDF_ERR_RET(nc_inq_grpname_len(nGroupId, &nFullNameLen));
@@ -10720,7 +10728,7 @@ static CPLErr NCDFGetGroupFullName( int nGroupId, char **ppszFullName,
     if( status != NC_NOERR )
     {
         CPLFree(*ppszFullName);
-        ppszFullName = nullptr;
+        *ppszFullName = nullptr;
         NCDF_ERR_RET(status);
     }
 #else
@@ -10741,6 +10749,7 @@ static CPLErr NCDFGetGroupFullName( int nGroupId, char **ppszFullName,
 static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
                                   char **ppszFullName, bool bNC3Compat )
 {
+    *ppszFullName = nullptr;
     char *pszGroupFullName = nullptr;
     ERR_RET(NCDFGetGroupFullName(nGroupId, &pszGroupFullName, bNC3Compat));
     char szVarName[NC_MAX_NAME + 1];
@@ -10769,6 +10778,7 @@ static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
 // Get the NetCDF root group ID of a given group ID.
 static CPLErr NCDFGetRootGroup( int nStartGroupId, int *pnRootGroupId )
 {
+    *pnRootGroupId = -1;
 #ifdef NETCDF_HAS_NC4
     // Recurse on parent group.
     int nParentGroupId;
@@ -10789,6 +10799,13 @@ static CPLErr NCDFResolveElem( int nStartGroupId,
                                const char *pszVar, const char *pszAtt,
                                int *pnGroupId, int *pnId, bool bMandatory )
 {
+    if( !pszVar && !pszAtt )
+    {
+        CPLError(CE_Failure, CPLE_IllegalArg,
+                 "pszVar and pszAtt NCDFResolveElem() args are both null.");
+        return CE_Failure;
+    }
+
     enum {NCRM_PARENT, NCRM_WIDTH_WISE} eNCResolveMode = NCRM_PARENT;
 
     std::queue<int> aoQueueGroupIdsToVisit;
@@ -10802,7 +10819,7 @@ static CPLErr NCDFResolveElem( int nStartGroupId,
 
         // Look if this group contains the searched element.
         int status;
-        if( pszVar != nullptr )
+        if( pszVar )
             status = nc_inq_varid(*pnGroupId, pszVar, pnId);
         else // pszAtt != nullptr.
             status = nc_inq_attid(*pnGroupId, NC_GLOBAL, pszAtt, pnId);
@@ -10811,59 +10828,58 @@ static CPLErr NCDFResolveElem( int nStartGroupId,
         {
             return CE_None;
         }
-        else if( (pszVar != nullptr && status != NC_ENOTVAR) ||
-                 (pszAtt != nullptr && status != NC_ENOTATT) )
+        else if( (pszVar && status != NC_ENOTVAR) ||
+                 (pszAtt && status != NC_ENOTATT) )
         {
-            NCDF_ERR_RET(status);
+            NCDF_ERR(status);
         }
 #ifdef NETCDF_HAS_NC4
         // Element not found, in NC4 case we must search in other groups
         // following the CF logic.
-        else
-        {
-            // The first resolve mode consists to search on parent groups.
-            if( eNCResolveMode == NCRM_PARENT )
-            {
-                int nParentGroupId;
-                int status2 = nc_inq_grp_parent(*pnGroupId, &nParentGroupId);
-                if( status2 == NC_NOERR )
-                    aoQueueGroupIdsToVisit.push(nParentGroupId);
-                else if( status2 != NC_ENOGRP )
-                    NCDF_ERR_RET(status2);
-                else if( pszVar != nullptr )
-                    // When resolving a variable, if there is no more
-                    // parent group then we switch to width-wise search mode
-                    // starting from the latest found parent group.
-                    eNCResolveMode = NCRM_WIDTH_WISE;
-            }
 
-            // The second resolve mode is a width-wise search.
-            if( eNCResolveMode == NCRM_WIDTH_WISE )
-            {
-                // Enqueue all direct sub-groups.
-                int nSubGroups, *panSubGroupIds = nullptr;
-                ERR_RET(NCDFGetSubGroups(*pnGroupId,
-                        &nSubGroups, &panSubGroupIds));
-                for( int i = 0; i < nSubGroups; i++ )
-                    aoQueueGroupIdsToVisit.push(panSubGroupIds[i]);
-                CPLFree(panSubGroupIds);
-            }
+        // The first resolve mode consists to search on parent groups.
+        if( eNCResolveMode == NCRM_PARENT )
+        {
+            int nParentGroupId = -1;
+            int status2 = nc_inq_grp_parent(*pnGroupId, &nParentGroupId);
+            if( status2 == NC_NOERR )
+                aoQueueGroupIdsToVisit.push(nParentGroupId);
+            else if( status2 != NC_ENOGRP )
+                NCDF_ERR(status2);
+            if( pszVar )
+                // When resolving a variable, if there is no more
+                // parent group then we switch to width-wise search mode
+                // starting from the latest found parent group.
+                eNCResolveMode = NCRM_WIDTH_WISE;
+        }
+
+        // The second resolve mode is a width-wise search.
+        if( eNCResolveMode == NCRM_WIDTH_WISE )
+        {
+            // Enqueue all direct sub-groups.
+            int nSubGroups = 0, *panSubGroupIds = nullptr;
+            NCDFGetSubGroups(*pnGroupId, &nSubGroups, &panSubGroupIds);
+            for( int i = 0; i < nSubGroups; i++ )
+                aoQueueGroupIdsToVisit.push(panSubGroupIds[i]);
+            CPLFree(panSubGroupIds);
         }
 #endif
     }
 
     if( bMandatory )
     {
-        char *pszStartGroupFullName;
+        char *pszStartGroupFullName = nullptr;
         NCDFGetGroupFullName(nStartGroupId, &pszStartGroupFullName);
         CPLError(CE_Failure, CPLE_AppDefined,
                 "Cannot resolve mandatory %s %s from group %s",
-                (pszVar != nullptr ? pszVar : pszAtt),
-                (pszVar != nullptr ? "variable" : "attribute"),
-                pszStartGroupFullName);
+                (pszVar ? pszVar : pszAtt),
+                (pszVar ? "variable" : "attribute"),
+                (pszStartGroupFullName ? pszStartGroupFullName : ""));
         CPLFree(pszStartGroupFullName);
     }
 
+    *pnGroupId = -1;
+    *pnId = -1;
     return CE_Failure;
 }
 
@@ -10890,6 +10906,8 @@ static CPLErr NCDFResolveVar( int nStartGroupId, const char *pszVar,
                               int *pnGroupId, int *pnVarId,
                               bool bMandatory )
 {
+    *pnGroupId = -1;
+    *pnVarId = -1;
     int nGroupId = nStartGroupId, nVarId;
     if( pszVar[0] == '/' )
     {
@@ -10914,6 +10932,7 @@ static CPLErr NCDFResolveVarFullName( int nStartGroupId, const char *pszVar,
                                       char **ppszFullName,
                                       bool bMandatory )
 {
+    ppszFullName = nullptr;
     int nGroupId, nVarId;
     ERR_RET(NCDFResolveVar(nStartGroupId, pszVar, &nGroupId, &nVarId,
                            bMandatory));
@@ -10939,7 +10958,7 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
                                        int *pnVars, int *pnGroupId,
                                        int *pnVarId, int *pnIgnoredVars )
 {
-    int nVars;
+    int nVars = 0;
     NCDF_ERR_RET(nc_inq(nCdfId, nullptr, &nVars, nullptr, nullptr));
 
     for( int v = 0; v < nVars; v++ )
@@ -10969,13 +10988,12 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
     }
 
     // Recurse on sub-groups.
-    int nSubGroups, *panSubGroupIds = nullptr;
-    ERR_RET(NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds));
+    int nSubGroups = 0, *panSubGroupIds = nullptr;
+    NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds);
     for( int i = 0; i < nSubGroups; i++ )
     {
-        ERR_RET(NCDFFilterRasterVarsRec(panSubGroupIds[i], papszIgnoredVars,
-                                        pnVars, pnGroupId, pnVarId,
-                                        pnIgnoredVars));
+        NCDFFilterRasterVarsRec(panSubGroupIds[i], papszIgnoredVars,
+                                pnVars, pnGroupId, pnVarId, pnIgnoredVars);
     }
     CPLFree(panSubGroupIds);
 
@@ -10987,13 +11005,16 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
 static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
                                     int *pnVarId, int *pnIgnoredVars )
 {
+    *pnVars = 0;
+    *pnGroupId = -1;
+    *pnVarId = -1;
+    *pnIgnoredVars = 0;
+
     // Identify coordinate and boundary variables that we should
     // ignore as Raster Bands.
     char **papszIgnoredVars = nullptr;
     NCDFGetCoordAndBoundVarFullNames(nCdfId, &papszIgnoredVars);
 
-    *pnVars = 0;
-    *pnIgnoredVars = 0;
     CPLErr eErr = NCDFFilterRasterVarsRec(nCdfId, papszIgnoredVars, pnVars,
                                           pnGroupId, pnVarId, pnIgnoredVars);
     CSLDestroy(papszIgnoredVars);
@@ -11012,8 +11033,9 @@ static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
 static CPLErr NCDFGetCoordAndBoundVarFullNames( int nCdfId,
                                                 char ***ppapszVars )
 {
-    int nVars;
-    NCDF_ERR_RET(nc_inq( nCdfId, nullptr, &nVars, nullptr, nullptr));
+    *ppapszVars = nullptr;
+    int nVars = 0;
+    NCDF_ERR(nc_inq( nCdfId, nullptr, &nVars, nullptr, nullptr));
 
     for( int v = 0; v < nVars; v++ )
     {
@@ -11040,11 +11062,10 @@ static CPLErr NCDFGetCoordAndBoundVarFullNames( int nCdfId,
 
     // Recurse on sub-groups.
     int nSubGroups, *panSubGroupIds = nullptr;
-    ERR_RET(NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds));
+    NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds);
     for( int i = 0; i < nSubGroups; i++ )
     {
-        ERR_RET(NCDFGetCoordAndBoundVarFullNames(panSubGroupIds[i],
-                                                 ppapszVars));
+        NCDFGetCoordAndBoundVarFullNames(panSubGroupIds[i], ppapszVars);
     }
     CPLFree(panSubGroupIds);
 
