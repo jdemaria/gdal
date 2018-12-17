@@ -141,8 +141,6 @@ static CPLErr NCDFResolveVarFullName( int nStartGroupId, const char *pszVar,
 static CPLErr NCDFResolveAttInt( int nStartGroupId, int nStartVarId,
                                  const char *pszAtt, int *pnAtt,
                                  bool bMandatory=false );
-static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
-                                    int *pnVarId, int *pnIgnoredVars );
 static CPLErr NCDFGetCoordAndBoundVarFullNames( int nCdfId,
                                                 char ***ppapszVars );
 
@@ -2259,8 +2257,8 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
 
     // Look for grid_mapping metadata.
 
-    char *szGridMappingValue = CPLStrdup(FetchAttr(nGroupId, nVarId,
-                                                   CF_GRD_MAPPING));
+    const char *pszValue = FetchAttr(nGroupId, nVarId, CF_GRD_MAPPING);
+    char *szGridMappingValue = CPLStrdup(pszValue ? pszValue : "");
 
     if( !EQUAL(szGridMappingValue, "") )
     {
@@ -2301,7 +2299,7 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
     //    it was created with the new driver
     // 2) Else, if spatial_ref and GeoTransform are present in the
     //    grid_mapping variable, it was created by the old driver
-    const char *pszValue = FetchAttr("NC_GLOBAL", "GDAL");
+    pszValue = FetchAttr("NC_GLOBAL", "GDAL");
 
     if( pszValue && NCDFIsGDALVersionGTE(pszValue, 1900))
     {
@@ -6925,519 +6923,18 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
 
     poDS->ReadAttributes(cdfid, NC_GLOBAL);
 
-    int nCount = 0;
-    int nVarID = -1;
-    int nGroupID = -1;
-    int nIgnoredVars = 0;
-    char *pszTemp = nullptr;
-
-    // TODO(jdemaria): at this time I failed to merge the vector code below
-    // with support of raster groups...
-#ifndef ENABLE_NETCDF_VECTOR_MODE
-    NCDFFilterRasterVars(cdfid, &nCount, &nGroupID, &nVarID, &nIgnoredVars);
-#else
-    // In vector only mode, if the file is NC4, if the main group has no
-    // variables but there are sub-groups, then iterate over the subgroups to
-    // check if there are vector layers.
-#ifdef NETCDF_HAS_NC4
-    int nGroupCount = 0;
-    int *panGroupIds = nullptr;
-    if( nvars == 0 &&
-        poDS->eFormat == NCDF_FORMAT_NC4 &&
-        (poOpenInfo->nOpenFlags & GDAL_OF_RASTER) == 0 &&
-        (poOpenInfo->nOpenFlags & GDAL_OF_VECTOR) != 0 )
-    {
-        nc_inq_grps(cdfid, &nGroupCount, nullptr);
-    }
-    if( nGroupCount > 0 )
-    {
-        panGroupIds = static_cast<int *>(CPLMalloc(sizeof(int) * nGroupCount));
-        nc_inq_grps(cdfid, nullptr, panGroupIds);
-    }
-    for( int iGrp = 0; iGrp < ((nGroupCount) ? nGroupCount : 1); iGrp ++ )
-    {
-        char szGroupName[NC_MAX_NAME + 1];
-        szGroupName[0] = 0;
-        int iGrpId = (nGroupCount) ? panGroupIds[iGrp] : cdfid;
-        if( nGroupCount )
-        {
-            nc_inq_grpname(iGrpId, szGroupName);
-            ndims = 0;
-            ngatts = 0;
-            nvars = 0;
-            unlimdimid = -1;
-            status = nc_inq(iGrpId, &ndims, &nvars, &ngatts, &unlimdimid);
-            NCDF_ERR(status);
-
-            CSLDestroy(poDS->papszMetadata);
-            poDS->papszMetadata = nullptr;
-            poDS->ReadAttributes(cdfid, NC_GLOBAL);
-            poDS->ReadAttributes(iGrpId, NC_GLOBAL);
-        }
-        else
-        {
-            snprintf(szGroupName, sizeof(szGroupName), "%s",
-                     CPLGetBasename(poDS->osFilename));
-        }
-        poDS->cdfid = iGrpId;
-#else
-    char szGroupName[NC_MAX_NAME + 1];
-    snprintf(szGroupName, sizeof(szGroupName),
-             "%s", CPLGetBasename(poDS->osFilename));
-#endif
-
-    // Identify variables that we should ignore as Raster Bands.
-    // Variables that are identified in other variable's "coordinate" and
-    // "bounds" attribute should not be treated as Raster Bands.
-    // See CF sections 5.2, 5.6 and 7.1.
+    // Identify coordinate and boundary variables that we should
+    // ignore as Raster Bands.
     char **papszIgnoreVars = nullptr;
+    NCDFGetCoordAndBoundVarFullNames(cdfid, &papszIgnoreVars);
+    // Filter variables to keep only valid 2+D raster bands and vector fields.
+    int nCount = 0, nIgnoredVars = 0;
+    int nGroupID = -1, nVarID = -1;
+    poDS->FilterVars(cdfid, poOpenInfo->nOpenFlags & GDAL_OF_RASTER,
+                     poOpenInfo->nOpenFlags & GDAL_OF_VECTOR, papszIgnoreVars,
+                     &nCount, &nGroupID, &nVarID, &nIgnoredVars);
+    CSLDestroy(papszIgnoreVars);
 
-        for( int j = 0; j < nvars; j++ )
-        {
-            if( NCDFGetAttr(poDS->cdfid, j, "coordinates", &pszTemp) == CE_None )
-            {
-                char **papszTokens = CSLTokenizeString2(pszTemp, " ", 0);
-                for( int i = 0; i<CSLCount(papszTokens); i++ )
-                {
-                    papszIgnoreVars =
-                        CSLAddString(papszIgnoreVars, papszTokens[i]);
-                }
-                if( papszTokens ) CSLDestroy(papszTokens);
-                CPLFree(pszTemp);
-             }
-            if( NCDFGetAttr(poDS->cdfid, j, "bounds", &pszTemp) == CE_None &&
-                pszTemp != nullptr )
-            {
-                if( !EQUAL(pszTemp, "") )
-                    papszIgnoreVars = CSLAddString(papszIgnoreVars, pszTemp);
-                CPLFree(pszTemp);
-            }
-        }
-
-        // Filter variables (valid 2D raster bands and vector fields).
-        nIgnoredVars = 0;
-        std::vector<int> anPotentialVectorVarID;
-        // oMapDimIdToCount[x] = number of times dim x is the first dimension of
-        // potential vector variables
-        std::map<int, int> oMapDimIdToCount;
-        int nVarXId = -1;
-        int nVarYId = -1;
-        int nVarZId = -1;
-        bool bIsVectorOnly = true;
-        int nProfileDimId = -1;
-        int nParentIndexVarID = -1;
-
-        for( int j = 0; j < nvars; j++ )
-        {
-            int ndimsForVar = -1;
-            char szTemp[NC_MAX_NAME + 1];
-            nc_inq_varndims(poDS->cdfid, j, &ndimsForVar);
-            // Should we ignore this variable?
-            szTemp[0] = '\0';
-            status = nc_inq_varname(poDS->cdfid, j, szTemp);
-            if( status != NC_NOERR )
-                continue;
-
-            nc_type atttype = NC_NAT;
-            size_t attlen = 0;
-
-            if( ndimsForVar == 1 &&
-                (NCDFIsVarLongitude(poDS->cdfid, -1, szTemp) ||
-                NCDFIsVarProjectionX(poDS->cdfid, -1, szTemp)) )
-            {
-                nVarXId = j;
-            }
-            else if( ndimsForVar == 1 &&
-                     (NCDFIsVarLatitude(poDS->cdfid, -1, szTemp) ||
-                      NCDFIsVarProjectionY(poDS->cdfid, -1, szTemp)) )
-            {
-                nVarYId = j;
-            }
-            else if( ndimsForVar == 1 &&
-                     NCDFIsVarVerticalCoord(poDS->cdfid, -1, szTemp) )
-            {
-                nVarZId = j;
-            }
-            else if( CSLFindString(papszIgnoreVars, szTemp) != -1 )
-            {
-                nIgnoredVars++;
-                CPLDebug("GDAL_netCDF", "variable #%d [%s] was ignored", j,
-                         szTemp);
-            }
-            // Only accept 2+D vars.
-            else if( ndimsForVar >= 2 )
-            {
-
-                // Identify variables that might be vector variables
-                if( ndimsForVar == 2 )
-                {
-                    int anDimIds[2] = { -1, -1 };
-                    nc_inq_vardimid(poDS->cdfid, j, anDimIds);
-
-                    nc_type vartype = NC_NAT;
-                    nc_inq_vartype(poDS->cdfid, j, &vartype);
-
-                    char szDimNameX[NC_MAX_NAME + 1];
-                    char szDimNameY[NC_MAX_NAME + 1];
-                    szDimNameX[0] = '\0';
-                    szDimNameY[0] = '\0';
-                    if( vartype == NC_CHAR &&
-                        nc_inq_dimname(poDS->cdfid, anDimIds[0], szDimNameY) ==
-                           NC_NOERR &&
-                       nc_inq_dimname(poDS->cdfid, anDimIds[1], szDimNameX) ==
-                           NC_NOERR &&
-                       NCDFIsVarLongitude(poDS->cdfid, -1, szDimNameX) ==
-                           false &&
-                       NCDFIsVarProjectionX(poDS->cdfid, -1, szDimNameX) ==
-                           false &&
-                       NCDFIsVarLatitude(poDS->cdfid, -1, szDimNameY) ==
-                           false &&
-                       NCDFIsVarProjectionY(poDS->cdfid, -1, szDimNameY) ==
-                           false )
-                    {
-                        anPotentialVectorVarID.push_back(j);
-                        oMapDimIdToCount[anDimIds[0]]++;
-                    }
-                    else
-                    {
-                        bIsVectorOnly = false;
-                    }
-                }
-                else
-                {
-                    bIsVectorOnly = false;
-                }
-                if( (poOpenInfo->nOpenFlags & GDAL_OF_RASTER) != 0 )
-                {
-                    nVarID = j;
-                    nCount++;
-                }
-            }
-            else if( ndimsForVar == 1 )
-            {
-                if( nc_inq_att(poDS->cdfid, j, "instance_dimension", &atttype,
-                               &attlen) == NC_NOERR &&
-                    atttype == NC_CHAR && attlen < NC_MAX_NAME )
-                {
-                    char szInstanceDimension[NC_MAX_NAME + 1];
-                    if( nc_get_att_text(poDS->cdfid, j, "instance_dimension",
-                                        szInstanceDimension) == NC_NOERR )
-                    {
-                        szInstanceDimension[attlen] = 0;
-                        for(int idim = 0; idim < ndims; idim++)
-                        {
-                            char szDimName[NC_MAX_NAME + 1];
-                            szDimName[0] = 0;
-                            status =
-                                nc_inq_dimname(poDS->cdfid, idim, szDimName);
-                            NCDF_ERR(status);
-                        if( strcmp(szInstanceDimension, szDimName) == 0 )
-                            {
-                                nParentIndexVarID = j;
-                                nProfileDimId = idim;
-                                break;
-                            }
-                        }
-                        if( nProfileDimId < 0 )
-                        {
-                            CPLError(CE_Warning, CPLE_AppDefined,
-                                     "Attribute instance_dimension='%s' refers "
-                                     "to a non existing dimension",
-                                     szInstanceDimension);
-                        }
-                    }
-                }
-                if( j != nParentIndexVarID )
-                {
-                    anPotentialVectorVarID.push_back(j);
-                    int nDimId = -1;
-                    nc_inq_vardimid(poDS->cdfid, j, &nDimId);
-                    oMapDimIdToCount[nDimId]++;
-                }
-            }
-        }
-
-        CSLDestroy(papszIgnoreVars);
-
-        CPLString osFeatureType(CSLFetchNameValueDef(
-            poDS->papszMetadata, "NC_GLOBAL#featureType", ""));
-
-        // If we are opened in raster-only mode and that there are only 1D or 2D
-        // variables and that the 2D variables have no X/Y dim, and all
-        // variables refer to the same main dimension (or 2 dimensions for
-        // featureType=profile), then it is a pure vector dataset
-        if( (poOpenInfo->nOpenFlags & GDAL_OF_RASTER) != 0 &&
-            (poOpenInfo->nOpenFlags & GDAL_OF_VECTOR) == 0 &&
-            bIsVectorOnly && nCount > 0 &&
-            !anPotentialVectorVarID.empty() &&
-            (oMapDimIdToCount.size() == 1 ||
-             (EQUAL(osFeatureType, "profile") && oMapDimIdToCount.size() == 2 &&
-              nProfileDimId >= 0)) )
-        {
-            anPotentialVectorVarID.resize(0);
-            nCount = 0;
-        }
-
-        if( !anPotentialVectorVarID.empty() &&
-            (poOpenInfo->nOpenFlags & GDAL_OF_VECTOR) != 0 )
-        {
-            // Take the dimension that is referenced the most times
-            if( !(oMapDimIdToCount.size() == 1 ||
-              (EQUAL(osFeatureType, "profile") && oMapDimIdToCount.size() == 2 && nProfileDimId >= 0)) )
-            {
-                CPLError(CE_Warning, CPLE_AppDefined,
-                         "The dataset has several variables that could be identified "
-                         "as vector fields, but not all share the same primary dimension. "
-                         "Consequently they will be ignored.");
-            }
-            else
-            {
-                OGRwkbGeometryType eGType = wkbUnknown;
-                CPLString osLayerName = CSLFetchNameValueDef(
-                poDS->papszMetadata, "NC_GLOBAL#ogr_layer_name", szGroupName);
-                poDS->papszMetadata = CSLSetNameValue(
-                    poDS->papszMetadata, "NC_GLOBAL#ogr_layer_name", nullptr);
-
-                if( EQUAL(osFeatureType, "point") ||
-                    EQUAL(osFeatureType, "profile") )
-                {
-                    poDS->papszMetadata = CSLSetNameValue(
-                        poDS->papszMetadata, "NC_GLOBAL#featureType", nullptr);
-                    eGType = wkbPoint;
-                }
-
-                const char *pszLayerType = CSLFetchNameValue(
-                    poDS->papszMetadata, "NC_GLOBAL#ogr_layer_type");
-                if( pszLayerType != nullptr )
-                {
-                    eGType = OGRFromOGCGeomType(pszLayerType);
-                    poDS->papszMetadata = CSLSetNameValue(
-                        poDS->papszMetadata, "NC_GLOBAL#ogr_layer_type", nullptr);
-                }
-
-                CPLString osGeometryField = CSLFetchNameValueDef(
-                    poDS->papszMetadata, "NC_GLOBAL#ogr_geometry_field", "");
-                poDS->papszMetadata = CSLSetNameValue(
-                    poDS->papszMetadata, "NC_GLOBAL#ogr_geometry_field", nullptr);
-
-                int nFirstVarId = -1;
-                int nVectorDim = oMapDimIdToCount.rbegin()->first;
-                if( EQUAL(osFeatureType, "profile") &&
-                    oMapDimIdToCount.size() == 2 )
-                {
-                    if( nVectorDim == nProfileDimId )
-                        nVectorDim = oMapDimIdToCount.begin()->first;
-                }
-                else
-                {
-                    nProfileDimId = -1;
-                }
-                for( size_t j = 0; j < anPotentialVectorVarID.size(); j++ )
-                {
-                    int anDimIds[2] = { -1, -1 };
-                    nc_inq_vardimid(poDS->cdfid, anPotentialVectorVarID[j],
-                                    anDimIds);
-                    if( nVectorDim == anDimIds[0] )
-                    {
-                        nFirstVarId = anPotentialVectorVarID[j];
-                        break;
-                    }
-                }
-
-                // In case where coordinates are explicitly specified for one of
-                // the field/variable,
-                // use them in priority over the ones that might have been
-                // identified above.
-                char *pszCoordinates = nullptr;
-                if( NCDFGetAttr(poDS->cdfid, nFirstVarId, "coordinates",
-                                &pszCoordinates) == CE_None )
-                {
-                    char **papszTokens =
-                        CSLTokenizeString2(pszCoordinates, " ", 0);
-                    for(int i = 0;
-                        papszTokens != nullptr && papszTokens[i] != nullptr; i++)
-                    {
-                        if( NCDFIsVarLongitude(poDS->cdfid, -1,
-                                               papszTokens[i]) ||
-                            NCDFIsVarProjectionX(poDS->cdfid, -1,
-                                                 papszTokens[i]) )
-                        {
-                            nVarXId = -1;
-                            CPL_IGNORE_RET_VAL(nc_inq_varid(
-                                poDS->cdfid, papszTokens[i], &nVarXId));
-                        }
-                        else if( NCDFIsVarLatitude(poDS->cdfid, -1,
-                                                   papszTokens[i]) ||
-                                 NCDFIsVarProjectionY(poDS->cdfid, -1,
-                                                      papszTokens[i]) )
-                        {
-                            nVarYId = -1;
-                            CPL_IGNORE_RET_VAL(nc_inq_varid(
-                                poDS->cdfid, papszTokens[i], &nVarYId));
-                        }
-                        else if( NCDFIsVarVerticalCoord(poDS->cdfid, -1,
-                                                       papszTokens[i]))
-                        {
-                            nVarZId = -1;
-                            CPL_IGNORE_RET_VAL(nc_inq_varid(
-                                poDS->cdfid, papszTokens[i], &nVarZId));
-                        }
-                    }
-                    CSLDestroy(papszTokens);
-                }
-                CPLFree(pszCoordinates);
-
-                // Check that the X,Y,Z vars share 1D and share the same
-                // dimension as attribute variables.
-                if( nVarXId >= 0 && nVarYId >= 0 )
-                {
-                    int nVarDimCount = -1;
-                    int nVarDimId = -1;
-                    if( nc_inq_varndims(poDS->cdfid, nVarXId, &nVarDimCount) != NC_NOERR ||
-                        nVarDimCount != 1 ||
-                        nc_inq_vardimid(poDS->cdfid, nVarXId, &nVarDimId) != NC_NOERR ||
-                        nVarDimId != ((nProfileDimId >= 0) ? nProfileDimId : nVectorDim) ||
-                        nc_inq_varndims(poDS->cdfid, nVarYId, &nVarDimCount) != NC_NOERR ||
-                        nVarDimCount != 1 ||
-                    nc_inq_vardimid(poDS->cdfid, nVarYId, &nVarDimId) != NC_NOERR ||
-                    nVarDimId != ((nProfileDimId >= 0) ? nProfileDimId : nVectorDim) )
-                    {
-                        nVarXId = nVarYId = -1;
-                    }
-                    else if( nVarZId >= 0 &&
-                             (nc_inq_varndims(poDS->cdfid, nVarZId,
-                                              &nVarDimCount) != NC_NOERR ||
-                              nVarDimCount != 1 ||
-                              nc_inq_vardimid(poDS->cdfid, nVarZId,
-                                              &nVarDimId) != NC_NOERR ||
-                              nVarDimId != nVectorDim) )
-                    {
-                        nVarZId = -1;
-                    }
-                }
-
-                if( eGType == wkbUnknown && nVarXId >= 0 && nVarYId >= 0 )
-                {
-                    eGType = wkbPoint;
-                }
-                if( eGType == wkbPoint && nVarXId >= 0 && nVarYId >= 0 &&
-                    nVarZId >= 0 )
-                {
-                    eGType = wkbPoint25D;
-                }
-                if( eGType == wkbUnknown && osGeometryField.empty() )
-                {
-                    eGType = wkbNone;
-                }
-
-                // Read projection info
-                char **papszMetadataBackup = CSLDuplicate(poDS->papszMetadata);
-                poDS->ReadAttributes(poDS->cdfid, nFirstVarId);
-                poDS->SetProjectionFromVar(nFirstVarId, true);
-
-                char szVarName[NC_MAX_NAME + 1];
-                szVarName[0] = '\0';
-                CPL_IGNORE_RET_VAL(
-                    nc_inq_varname(poDS->cdfid, nFirstVarId, szVarName));
-
-                CPLString osTemp;
-                osTemp = szVarName;
-                osTemp += "#";
-                osTemp += CF_GRD_MAPPING;
-                CPLString osGridMapping =
-                    CSLFetchNameValueDef(poDS->papszMetadata, osTemp, "");
-
-                CSLDestroy(poDS->papszMetadata);
-                poDS->papszMetadata = papszMetadataBackup;
-
-                OGRSpatialReference *poSRS = nullptr;
-                if( poDS->pszProjection != nullptr )
-                {
-                    poSRS = new OGRSpatialReference();
-                    if( poSRS->importFromWkt(poDS->pszProjection) != OGRERR_NONE )
-                    {
-                        delete poSRS;
-                        poSRS = nullptr;
-                    }
-                    CPLFree(poDS->pszProjection);
-                    poDS->pszProjection = nullptr;
-                }
-                // Reset if there's a 2D raster
-                poDS->bSetProjection = false;
-                poDS->bSetGeoTransform = false;
-
-                if( (poOpenInfo->nOpenFlags & GDAL_OF_RASTER) == 0 )
-                {
-                    // Strip out uninteresting metadata.
-                    poDS->papszMetadata = CSLSetNameValue(
-                        poDS->papszMetadata, "NC_GLOBAL#Conventions", nullptr);
-                    poDS->papszMetadata = CSLSetNameValue(
-                        poDS->papszMetadata, "NC_GLOBAL#GDAL", nullptr);
-                    poDS->papszMetadata = CSLSetNameValue(
-                        poDS->papszMetadata, "NC_GLOBAL#history", nullptr);
-                }
-
-                netCDFLayer *poLayer = new netCDFLayer(
-                    poDS, poDS->cdfid, osLayerName, eGType, poSRS);
-                if( poSRS != nullptr )
-                    poSRS->Release();
-                poLayer->SetRecordDimID(nVectorDim);
-                if( wkbFlatten(eGType) == wkbPoint && nVarXId >= 0 &&
-                    nVarYId >= 0 )
-                {
-                    poLayer->SetXYZVars(nVarXId, nVarYId, nVarZId);
-                }
-                else if( !osGeometryField.empty() )
-                {
-                    poLayer->SetWKTGeometryField(osGeometryField);
-                }
-                if( !osGridMapping.empty() )
-                {
-                    poLayer->SetGridMapping(osGridMapping);
-                }
-                poLayer->SetProfile(nProfileDimId, nParentIndexVarID);
-
-                for( size_t j = 0; j < anPotentialVectorVarID.size(); j++ )
-                {
-                    int anDimIds[2] = { -1, -1 };
-                    nc_inq_vardimid(poDS->cdfid, anPotentialVectorVarID[j],
-                                    anDimIds);
-                    if( anDimIds[0] == nVectorDim ||
-                        (nProfileDimId >= 0 && anDimIds[0] == nProfileDimId) )
-                    {
-#ifdef NCDF_DEBUG
-                        char szTemp2[NC_MAX_NAME + 1] = {};
-                        CPL_IGNORE_RET_VAL(nc_inq_varname(
-                            poDS->cdfid, anPotentialVectorVarID[j], szTemp2));
-                        CPLDebug("GDAL_netCDF", "Variable %s is a vector field",
-                                 szTemp2);
-#endif
-                        poLayer->AddField(anPotentialVectorVarID[j]);
-                    }
-                }
-
-                if( poLayer->GetLayerDefn()->GetFieldCount() != 0 ||
-                    poLayer->GetGeomType() != wkbNone )
-                {
-                    poDS->papoLayers = static_cast<netCDFLayer **>(
-                        CPLRealloc(poDS->papoLayers,
-                                (poDS->nLayers + 1) * sizeof(netCDFLayer *)));
-                    poDS->papoLayers[poDS->nLayers++] = poLayer;
-                }
-                else
-                {
-                    delete poLayer;
-                }
-
-            }
-        }
-
-#ifdef NETCDF_HAS_NC4
-    }  // End for group.
-    CPLFree(panGroupIds);
-    poDS->cdfid = cdfid;
-#endif
-#endif
     // Case where there is no raster variable
     if( nCount == 0 && !bTreatAsSubdataset )
     {
@@ -7786,10 +7283,11 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
                                 szDimName);
                         poDS->papszMetadata = CSLSetNameValue(
                             poDS->papszMetadata, szTemp, szExtraDimDef);
+                        char *pszTemp = nullptr;
                         if( NCDFGet1DVar(cdfid, nIdxVarID, &pszTemp) == CE_None )
                         {
                             snprintf(szTemp, sizeof(szTemp), "NETCDF_DIM_%s_VALUES",
-                                    szDimName);
+                                     szDimName);
                             poDS->papszMetadata = CSLSetNameValue(
                                 poDS->papszMetadata, szTemp, pszTemp);
                             CPLFree(pszTemp);
@@ -10953,37 +10451,188 @@ static CPLErr NCDFResolveAttInt( int nStartGroupId, int nStartVarId,
     return CE_None;
 }
 
-// Implementation of NCDFFilterRasterVars recursions.
-static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
-                                       int *pnVars, int *pnGroupId,
-                                       int *pnVarId, int *pnIgnoredVars )
+// Filter variables to keep only valid 2+D raster bands and vector fields in
+// a given a NetCDF (or group) ID and its sub-groups.
+// Coordinate or boundary variables are ignored.
+// It also create corresponding vector layers.
+CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
+                                     bool bKeepVectors, char **papszIgnoreVars,
+                                     int *pnVars, int *pnGroupId, int *pnVarId,
+                                     int *pnIgnoredVars )
 {
     int nVars = 0;
-    NCDF_ERR_RET(nc_inq(nCdfId, nullptr, &nVars, nullptr, nullptr));
+    NCDF_ERR(nc_inq(nCdfId, nullptr, &nVars, nullptr, nullptr));
+
+    std::vector<int> anPotentialVectorVarID;
+    // oMapDimIdToCount[x] = number of times dim x is the first dimension of
+    // potential vector variables
+    std::map<int, int> oMapDimIdToCount;
+    int nVarXId = -1;
+    int nVarYId = -1;
+    int nVarZId = -1;
+    bool bIsVectorOnly = true;
+    int nProfileDimId = -1;
+    int nParentIndexVarID = -1;
 
     for( int v = 0; v < nVars; v++ )
     {
         int nVarDims;
         NCDF_ERR_RET(nc_inq_varndims(nCdfId, v, &nVarDims));
-        // Only accept 2+D vars.
-        if( nVarDims >= 2 )
+        // Should we ignore this variable?
+        char szTemp[NC_MAX_NAME + 1];
+        szTemp[0] = '\0';
+        NCDF_ERR_RET(nc_inq_varname(nCdfId, v, szTemp));
+
+        if( nVarDims == 1 && (NCDFIsVarLongitude(nCdfId, -1, szTemp) ||
+                              NCDFIsVarProjectionX(nCdfId, -1, szTemp)) )
+        {
+            nVarXId = v;
+        }
+        else if( nVarDims == 1 && (NCDFIsVarLatitude(nCdfId, -1, szTemp) ||
+                                   NCDFIsVarProjectionY(nCdfId, -1, szTemp)) )
+        {
+            nVarYId = v;
+        }
+        else if( nVarDims == 1 && NCDFIsVarVerticalCoord(nCdfId, -1, szTemp) )
+        {
+            nVarZId = v;
+        }
+        else
         {
             char *pszVarFullName = nullptr;
-            ERR_RET(NCDFGetVarFullName(nCdfId, v, &pszVarFullName));
-            // Should we ignore this variable?
-            if( CSLFindString(papszIgnoredVars, pszVarFullName) != -1 )
+            CPLErr eErr = NCDFGetVarFullName(nCdfId, v, &pszVarFullName);
+            if( eErr != CE_None ) {
+                CPLFree(pszVarFullName);
+                continue;
+            }
+            bool bIgnoreVar = (CSLFindString(papszIgnoreVars, pszVarFullName)
+                               != -1);
+            CPLFree(pszVarFullName);
+            if( bIgnoreVar )
             {
                 (*pnIgnoredVars)++;
-                CPLDebug("GDAL_netCDF", "variable #%d [%s] was ignored",
-                         v, pszVarFullName);
+                CPLDebug("GDAL_netCDF", "variable #%d [%s] was ignored", v,
+                        szTemp);
             }
-            else
+            // Only accept 2+D vars.
+            else if( nVarDims >= 2 )
             {
-                *pnGroupId = nCdfId;
-                *pnVarId = v;
-                (*pnVars)++;
+
+                // Identify variables that might be vector variables
+                if( nVarDims == 2 )
+                {
+                    int anDimIds[2] = { -1, -1 };
+                    nc_inq_vardimid(nCdfId, v, anDimIds);
+
+                    nc_type vartype = NC_NAT;
+                    nc_inq_vartype(nCdfId, v, &vartype);
+
+                    char szDimNameX[NC_MAX_NAME + 1];
+                    char szDimNameY[NC_MAX_NAME + 1];
+                    szDimNameX[0] = '\0';
+                    szDimNameY[0] = '\0';
+                    if( vartype == NC_CHAR &&
+                        nc_inq_dimname(nCdfId, anDimIds[0], szDimNameY) ==
+                            NC_NOERR &&
+                        nc_inq_dimname(nCdfId, anDimIds[1], szDimNameX) ==
+                            NC_NOERR &&
+                        !NCDFIsVarLongitude(nCdfId, -1, szDimNameX) &&
+                        !NCDFIsVarProjectionX(nCdfId, -1, szDimNameX) &&
+                        !NCDFIsVarLatitude(nCdfId, -1, szDimNameY) &&
+                        !NCDFIsVarProjectionY(nCdfId, -1, szDimNameY) )
+                    {
+                        anPotentialVectorVarID.push_back(v);
+                        oMapDimIdToCount[anDimIds[0]]++;
+                    }
+                    else
+                    {
+                        bIsVectorOnly = false;
+                    }
+                }
+                else
+                {
+                    bIsVectorOnly = false;
+                }
+                if( bKeepRasters )
+                {
+                    *pnVarId = v;
+                    (*pnVars)++;
+                }
             }
-            CPLFree(pszVarFullName);
+            else if( nVarDims == 1 )
+            {
+                nc_type atttype = NC_NAT;
+                size_t attlen = 0;
+                if( nc_inq_att(nCdfId, v, "instance_dimension", &atttype,
+                               &attlen) == NC_NOERR &&
+                    atttype == NC_CHAR && attlen < NC_MAX_NAME )
+                {
+                    char szInstanceDimension[NC_MAX_NAME + 1];
+                    if( nc_get_att_text(nCdfId, v, "instance_dimension",
+                                        szInstanceDimension) == NC_NOERR )
+                    {
+                        szInstanceDimension[attlen] = 0;
+                        int status = nc_inq_dimid(nCdfId, szInstanceDimension,
+                                                  &nProfileDimId);
+                        if( status == NC_NOERR )
+                            nParentIndexVarID = v;
+                        else
+                            nProfileDimId = -1;
+                        if( status == NC_EBADDIM )
+                            CPLError(CE_Warning, CPLE_AppDefined,
+                                     "Attribute instance_dimension='%s' refers "
+                                     "to a non existing dimension",
+                                     szInstanceDimension);
+                        else
+                            NCDF_ERR(status);
+                    }
+                }
+                if( v != nParentIndexVarID )
+                {
+                    anPotentialVectorVarID.push_back(v);
+                    int nDimId = -1;
+                    nc_inq_vardimid(nCdfId, v, &nDimId);
+                    oMapDimIdToCount[nDimId]++;
+                }
+            }
+        }
+    }
+
+    // If we are opened in raster-only mode and that there are only 1D or 2D
+    // variables and that the 2D variables have no X/Y dim, and all
+    // variables refer to the same main dimension (or 2 dimensions for
+    // featureType=profile), then it is a pure vector dataset
+    CPLString osFeatureType(CSLFetchNameValueDef(papszMetadata,
+                                                 "NC_GLOBAL#featureType", ""));
+    if( bKeepRasters && !bKeepVectors &&
+        bIsVectorOnly && *pnVars > 0 &&
+        !anPotentialVectorVarID.empty() &&
+        (oMapDimIdToCount.size() == 1 || (EQUAL(osFeatureType, "profile") &&
+                                          oMapDimIdToCount.size() == 2 &&
+                                          nProfileDimId >= 0)) )
+    {
+        anPotentialVectorVarID.resize(0);
+        *pnVars = 0;
+    }
+
+    if( !anPotentialVectorVarID.empty() && bKeepVectors )
+    {
+        // Take the dimension that is referenced the most times.
+        if( !(oMapDimIdToCount.size() == 1 ||
+            (EQUAL(osFeatureType, "profile") &&
+             oMapDimIdToCount.size() == 2 && nProfileDimId >= 0)) )
+        {
+            CPLError(CE_Warning, CPLE_AppDefined,
+                    "The dataset has several variables that could be "
+                    "identified as vector fields, but not all share the same "
+                    "primary dimension. Consequently they will be ignored.");
+        }
+        else
+        {
+            CreateGrpVectorLayers(nCdfId, osFeatureType,
+                                  anPotentialVectorVarID, oMapDimIdToCount,
+                                  nVarXId, nVarYId, nVarZId, nProfileDimId,
+                                  nParentIndexVarID, bKeepRasters);
         }
     }
 
@@ -10992,34 +10641,248 @@ static CPLErr NCDFFilterRasterVarsRec( int nCdfId, char **papszIgnoredVars,
     NCDFGetSubGroups(nCdfId, &nSubGroups, &panSubGroupIds);
     for( int i = 0; i < nSubGroups; i++ )
     {
-        NCDFFilterRasterVarsRec(panSubGroupIds[i], papszIgnoredVars,
-                                pnVars, pnGroupId, pnVarId, pnIgnoredVars);
+        FilterVars(panSubGroupIds[i], bKeepRasters, bKeepVectors,
+                   papszIgnoreVars, pnVars, pnGroupId, pnVarId, pnIgnoredVars);
     }
     CPLFree(panSubGroupIds);
 
     return CE_None;
 }
 
-// Filter raster variables (2+D non coordinate or boundary variables) in
-// a given a NetCDF (or group) ID and its sub-groups.
-static CPLErr NCDFFilterRasterVars( int nCdfId, int *pnVars, int *pnGroupId,
-                                    int *pnVarId, int *pnIgnoredVars )
+// Create vector layers from given potentially identified vector variables
+// resulting from the scanning of a NetCDF (or group) ID.
+CPLErr netCDFDataset::CreateGrpVectorLayers( int nCdfId,
+                                             CPLString osFeatureType,
+                                             std::vector<int> anPotentialVectorVarID,
+                                             std::map<int, int> oMapDimIdToCount,
+                                             int nVarXId, int nVarYId, int nVarZId,
+                                             int nProfileDimId,
+                                             int nParentIndexVarID,
+                                             bool bKeepRasters )
 {
-    *pnVars = 0;
-    *pnGroupId = -1;
-    *pnVarId = -1;
-    *pnIgnoredVars = 0;
+    char *pszGroupName = nullptr;
+    NCDFGetGroupFullName(nCdfId, &pszGroupName);
+    if( pszGroupName[0] == '\0' )
+    {
+        CPLFree(pszGroupName);
+        pszGroupName = nullptr;
+        pszGroupName = CPLStrdup(CPLGetBasename(osFilename));
+    }
+    // TODO: maybe we should remove the leading / from name
+    OGRwkbGeometryType eGType = wkbUnknown;
+    CPLString osLayerName = CSLFetchNameValueDef(papszMetadata,
+                                                 "NC_GLOBAL#ogr_layer_name",
+                                                 pszGroupName);
+    CPLFree(pszGroupName);
+    papszMetadata = CSLSetNameValue(papszMetadata, "NC_GLOBAL#ogr_layer_name",
+                                    nullptr);
 
-    // Identify coordinate and boundary variables that we should
-    // ignore as Raster Bands.
-    char **papszIgnoredVars = nullptr;
-    NCDFGetCoordAndBoundVarFullNames(nCdfId, &papszIgnoredVars);
+    if( EQUAL(osFeatureType, "point") || EQUAL(osFeatureType, "profile") )
+    {
+        papszMetadata = CSLSetNameValue(papszMetadata, "NC_GLOBAL#featureType",
+                                        nullptr);
+        eGType = wkbPoint;
+    }
 
-    CPLErr eErr = NCDFFilterRasterVarsRec(nCdfId, papszIgnoredVars, pnVars,
-                                          pnGroupId, pnVarId, pnIgnoredVars);
-    CSLDestroy(papszIgnoredVars);
+    const char *pszLayerType = CSLFetchNameValue(papszMetadata,
+                                                 "NC_GLOBAL#ogr_layer_type");
+    if( pszLayerType != nullptr )
+    {
+        eGType = OGRFromOGCGeomType(pszLayerType);
+        papszMetadata = CSLSetNameValue(papszMetadata,
+                                        "NC_GLOBAL#ogr_layer_type", nullptr);
+    }
 
-    return eErr;
+    CPLString osGeometryField = CSLFetchNameValueDef(
+        papszMetadata, "NC_GLOBAL#ogr_geometry_field", "");
+    papszMetadata = CSLSetNameValue(
+        papszMetadata, "NC_GLOBAL#ogr_geometry_field", nullptr);
+
+    int nFirstVarId = -1;
+    int nVectorDim = oMapDimIdToCount.rbegin()->first;
+    if( EQUAL(osFeatureType, "profile") && oMapDimIdToCount.size() == 2 )
+    {
+        if( nVectorDim == nProfileDimId )
+            nVectorDim = oMapDimIdToCount.begin()->first;
+    }
+    else
+    {
+        nProfileDimId = -1;
+    }
+    for( size_t j = 0; j < anPotentialVectorVarID.size(); j++ )
+    {
+        int anDimIds[2] = { -1, -1 };
+        nc_inq_vardimid(nCdfId, anPotentialVectorVarID[j], anDimIds);
+        if( nVectorDim == anDimIds[0] )
+        {
+            nFirstVarId = anPotentialVectorVarID[j];
+            break;
+        }
+    }
+
+    // In case where coordinates are explicitly specified for one of the
+    // field/variable, use them in priority over the ones that might have been
+    // identified above.
+    char *pszCoordinates = nullptr;
+    if( NCDFGetAttr(nCdfId, nFirstVarId, "coordinates", &pszCoordinates)
+        == CE_None )
+    {
+        char **papszTokens = CSLTokenizeString2(pszCoordinates, " ", 0);
+        for(int i = 0;
+            papszTokens != nullptr && papszTokens[i] != nullptr; i++)
+        {
+            if( NCDFIsVarLongitude(nCdfId, -1, papszTokens[i]) ||
+                NCDFIsVarProjectionX(nCdfId, -1, papszTokens[i]) )
+            {
+                nVarXId = -1;
+                CPL_IGNORE_RET_VAL(nc_inq_varid(nCdfId, papszTokens[i],
+                                                &nVarXId));
+            }
+            else if( NCDFIsVarLatitude(nCdfId, -1, papszTokens[i]) ||
+                    NCDFIsVarProjectionY(nCdfId, -1, papszTokens[i]) )
+            {
+                nVarYId = -1;
+                CPL_IGNORE_RET_VAL(nc_inq_varid(nCdfId, papszTokens[i], 
+                                                &nVarYId));
+            }
+            else if( NCDFIsVarVerticalCoord(nCdfId, -1, papszTokens[i]))
+            {
+                nVarZId = -1;
+                CPL_IGNORE_RET_VAL(nc_inq_varid(nCdfId, papszTokens[i],
+                                                &nVarZId));
+            }
+        }
+        CSLDestroy(papszTokens);
+    }
+    CPLFree(pszCoordinates);
+
+    // Check that the X,Y,Z vars share 1D and share the same dimension as
+    // attribute variables.
+    if( nVarXId >= 0 && nVarYId >= 0 )
+    {
+        int nVarDimCount = -1;
+        int nVarDimId = -1;
+        if( nc_inq_varndims(nCdfId, nVarXId, &nVarDimCount) != NC_NOERR ||
+            nVarDimCount != 1 ||
+            nc_inq_vardimid(nCdfId, nVarXId, &nVarDimId) != NC_NOERR ||
+            nVarDimId != ((nProfileDimId >= 0) ? nProfileDimId : nVectorDim) ||
+            nc_inq_varndims(nCdfId, nVarYId, &nVarDimCount) != NC_NOERR ||
+            nVarDimCount != 1 ||
+            nc_inq_vardimid(nCdfId, nVarYId, &nVarDimId) != NC_NOERR ||
+            nVarDimId != ((nProfileDimId >= 0) ? nProfileDimId : nVectorDim) )
+        {
+            nVarXId = nVarYId = -1;
+        }
+        else if( nVarZId >= 0 && (nc_inq_varndims(nCdfId, nVarZId,
+                                                  &nVarDimCount) != NC_NOERR ||
+                                  nVarDimCount != 1 ||
+                                  nc_inq_vardimid(nCdfId, nVarZId,
+                                                  &nVarDimId) != NC_NOERR ||
+                                  nVarDimId != nVectorDim) )
+        {
+            nVarZId = -1;
+        }
+    }
+
+    if( eGType == wkbUnknown && nVarXId >= 0 && nVarYId >= 0 )
+    {
+        eGType = wkbPoint;
+    }
+    if( eGType == wkbPoint && nVarXId >= 0 && nVarYId >= 0 && nVarZId >= 0 )
+    {
+        eGType = wkbPoint25D;
+    }
+    if( eGType == wkbUnknown && osGeometryField.empty() )
+    {
+        eGType = wkbNone;
+    }
+
+    // Read projection info
+    char **papszMetadataBackup = CSLDuplicate(papszMetadata);
+    ReadAttributes(nCdfId, nFirstVarId);
+    SetProjectionFromVar(nCdfId, nFirstVarId, true);
+    const char *pszValue = FetchAttr(nCdfId, nFirstVarId, CF_GRD_MAPPING);
+    char *pszGridMapping = (pszValue ? CPLStrdup(pszValue) : nullptr);
+    CSLDestroy(papszMetadata);
+    papszMetadata = papszMetadataBackup;
+
+    OGRSpatialReference *poSRS = nullptr;
+    if( pszProjection != nullptr )
+    {
+        poSRS = new OGRSpatialReference();
+        if( poSRS->importFromWkt(pszProjection) != OGRERR_NONE )
+        {
+            delete poSRS;
+            poSRS = nullptr;
+        }
+        CPLFree(pszProjection);
+        pszProjection = nullptr;
+    }
+    // Reset if there's a 2D raster
+    bSetProjection = false;
+    bSetGeoTransform = false;
+
+    if( !bKeepRasters )
+    {
+        // Strip out uninteresting metadata.
+        papszMetadata = CSLSetNameValue(papszMetadata, "NC_GLOBAL#Conventions",
+                                        nullptr);
+        papszMetadata = CSLSetNameValue(papszMetadata, "NC_GLOBAL#GDAL",
+                                        nullptr);
+        papszMetadata = CSLSetNameValue(papszMetadata, "NC_GLOBAL#history",
+                                        nullptr);
+    }
+
+    netCDFLayer *poLayer = new netCDFLayer(this, nCdfId, osLayerName,
+                                           eGType, poSRS);
+    if( poSRS != nullptr )
+        poSRS->Release();
+    poLayer->SetRecordDimID(nVectorDim);
+    if( wkbFlatten(eGType) == wkbPoint && nVarXId >= 0 && nVarYId >= 0 )
+    {
+        poLayer->SetXYZVars(nVarXId, nVarYId, nVarZId);
+    }
+    else if( !osGeometryField.empty() )
+    {
+        poLayer->SetWKTGeometryField(osGeometryField);
+    }
+    if( pszGridMapping != nullptr )
+    {
+        poLayer->SetGridMapping(pszGridMapping);
+        CPLFree(pszGridMapping);
+    }
+    poLayer->SetProfile(nProfileDimId, nParentIndexVarID);
+
+    for( size_t j = 0; j < anPotentialVectorVarID.size(); j++ )
+    {
+        int anDimIds[2] = { -1, -1 };
+        nc_inq_vardimid(nCdfId, anPotentialVectorVarID[j], anDimIds);
+        if( anDimIds[0] == nVectorDim || (nProfileDimId >= 0 &&
+                                          anDimIds[0] == nProfileDimId) )
+        {
+#ifdef NCDF_DEBUG
+            char szTemp2[NC_MAX_NAME + 1] = {};
+            CPL_IGNORE_RET_VAL(nc_inq_varname(
+                nCdfId, anPotentialVectorVarID[j], szTemp2));
+            CPLDebug("GDAL_netCDF", "Variable %s is a vector field", szTemp2);
+#endif
+            poLayer->AddField(anPotentialVectorVarID[j]);
+        }
+    }
+
+    if( poLayer->GetLayerDefn()->GetFieldCount() != 0 ||
+        poLayer->GetGeomType() != wkbNone )
+    {
+        papoLayers = static_cast<netCDFLayer **>(
+            CPLRealloc(papoLayers, (nLayers + 1) * sizeof(netCDFLayer *)));
+        papoLayers[nLayers++] = poLayer;
+    }
+    else
+    {
+        delete poLayer;
+    }
+
+    return CE_None;
 }
 
 // Get all coordinate and boundary variables full names referenced in

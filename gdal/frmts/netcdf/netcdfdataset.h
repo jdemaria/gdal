@@ -879,6 +879,15 @@ class netCDFDataset final: public GDALPamDataset
                          int nDimIdToGrow, size_t nNewSize);
     bool GrowDim(int nLayerId, int nDimIdToGrow, size_t nNewSize);
 
+    CPLErr FilterVars( int nCdfId, bool bKeepRasters, bool bKeepVectors,
+                       char **papszIgnoreVars, int *pnVars,
+                       int *pnGroupId, int *pnVarId, int *pnIgnoredVars );
+    CPLErr CreateGrpVectorLayers( int nCdfId, CPLString osFeatureType,
+                                  std::vector<int> anPotentialVectorVarID,
+                                  std::map<int, int> oMapDimIdToCount,
+                                  int nVarXId, int nVarYId, int nVarZId,
+                                  int nProfileDimId, int nParentIndexVarID,
+                                  bool bKeepRasters );
   protected:
 
     CPLXMLNode *SerializeToXML( const char *pszVRTPath ) override;
