@@ -2255,8 +2255,7 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
         return;
     }
 
-    // Look for grid_mapping metadata.
-
+    // Look for grid_mapping metadata. 
     const char *pszValue = FetchAttr(nGroupId, nVarId, CF_GRD_MAPPING);
     char *szGridMappingValue = CPLStrdup(pszValue ? pszValue : "");
 
@@ -2277,7 +2276,7 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
             {
                 CPLDebug("GDAL_netCDF", "got grid_mapping %s",
                          szGridMappingValue);
-                if( FetchAttr(szGridMappingValue, NCDF_SPATIAL_REF) )
+                if( (pszWKT = FetchAttr(szGridMappingValue, NCDF_SPATIAL_REF)) )
                 {
                     pszGeoTransform = FetchAttr(szGridMappingValue,
                                                 NCDF_GEOTRANSFORM);
@@ -6979,8 +6978,12 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
     // the name of the single available variable as the subdataset.
     if( !bTreatAsSubdataset )
     {
+        //If we have gotten this far and groupId is -1, check root.
+        if (nGroupID == -1)
+            nGroupID = cdfid;
+
         char *pszVarName = nullptr;
-        NCDF_ERR(NCDFGetVarFullName(nGroupID, nVarID, &pszVarName));
+        NCDF_ERR(NCDFGetVarFullName(nGroupID, nVarID, &pszVarName, true));
         osSubdatasetName = (pszVarName != nullptr ? pszVarName : "");
         CPLFree(pszVarName);
     }
@@ -10248,6 +10251,7 @@ static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
                                   char **ppszFullName, bool bNC3Compat )
 {
     *ppszFullName = nullptr;
+
     char *pszGroupFullName = nullptr;
     ERR_RET(NCDFGetGroupFullName(nGroupId, &pszGroupFullName, bNC3Compat));
     char szVarName[NC_MAX_NAME + 1];
@@ -10267,6 +10271,7 @@ static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
     const char *pszSep = "/";
     if( EQUAL(pszGroupFullName, "/") || EQUAL(pszGroupFullName, "") )
         pszSep = "";
+
     *ppszFullName = CPLStrdup(CPLSPrintf("%s%s%s", pszGroupFullName, pszSep,
                                          szVarName));
     CPLFree(pszGroupFullName);
@@ -10430,7 +10435,7 @@ static CPLErr NCDFResolveVarFullName( int nStartGroupId, const char *pszVar,
                                       char **ppszFullName,
                                       bool bMandatory )
 {
-    ppszFullName = nullptr;
+    *ppszFullName = nullptr;
     int nGroupId, nVarId;
     ERR_RET(NCDFResolveVar(nStartGroupId, pszVar, &nGroupId, &nVarId,
                            bMandatory));
