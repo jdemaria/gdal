@@ -6928,15 +6928,15 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
     char **papszIgnoreVars = nullptr;
     NCDFGetCoordAndBoundVarFullNames(cdfid, &papszIgnoreVars);
     // Filter variables to keep only valid 2+D raster bands and vector fields.
-    int nCount = 0, nIgnoredVars = 0;
+    int nRasterVars = 0, nIgnoredVars = 0;
     int nGroupID = -1, nVarID = -1;
     poDS->FilterVars(cdfid, poOpenInfo->nOpenFlags & GDAL_OF_RASTER,
                      poOpenInfo->nOpenFlags & GDAL_OF_VECTOR, papszIgnoreVars,
-                     &nCount, &nGroupID, &nVarID, &nIgnoredVars);
+                     &nRasterVars, &nGroupID, &nVarID, &nIgnoredVars);
     CSLDestroy(papszIgnoreVars);
 
     // Case where there is no raster variable
-    if( nCount == 0 && !bTreatAsSubdataset )
+    if( nRasterVars == 0 && !bTreatAsSubdataset )
     {
         poDS->SetMetadata(poDS->papszMetadata);
         CPLReleaseMutex(hNCMutex);  // Release mutex otherwise we'll deadlock
@@ -6964,7 +6964,7 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
 
     // We have more than one variable with 2 dimensions in the
     // file, then treat this as a subdataset container dataset.
-    if( (nCount > 1) && !bTreatAsSubdataset )
+    if( (nRasterVars > 1) && !bTreatAsSubdataset )
     {
         poDS->CreateSubDatasetList(cdfid);
         poDS->SetMetadata(poDS->papszMetadata);
@@ -10454,13 +10454,14 @@ static CPLErr NCDFResolveAttInt( int nStartGroupId, int nStartVarId,
 // Filter variables to keep only valid 2+D raster bands and vector fields in
 // a given a NetCDF (or group) ID and its sub-groups.
 // Coordinate or boundary variables are ignored.
-// It also create corresponding vector layers.
+// It also creates corresponding vector layers.
 CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
-                                     bool bKeepVectors, char **papszIgnoreVars,
-                                     int *pnVars, int *pnGroupId, int *pnVarId,
-                                     int *pnIgnoredVars )
+                                  bool bKeepVectors, char **papszIgnoreVars,
+                                  int *pnRasterVars,
+                                  int *pnGroupId, int *pnVarId,
+                                  int *pnIgnoredVars )
 {
-    int nVars = 0;
+    int nVars = 0, nRasterVars = 0;
     NCDF_ERR(nc_inq(nCdfId, nullptr, &nVars, nullptr, nullptr));
 
     std::vector<int> anPotentialVectorVarID;
@@ -10556,7 +10557,7 @@ CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
                 if( bKeepRasters )
                 {
                     *pnVarId = v;
-                    (*pnVars)++;
+                    nRasterVars++;
                 }
             }
             else if( nVarDims == 1 )
@@ -10605,14 +10606,17 @@ CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
     CPLString osFeatureType(CSLFetchNameValueDef(papszMetadata,
                                                  "NC_GLOBAL#featureType", ""));
     if( bKeepRasters && !bKeepVectors &&
-        bIsVectorOnly && *pnVars > 0 &&
+        bIsVectorOnly && nRasterVars > 0 &&
         !anPotentialVectorVarID.empty() &&
         (oMapDimIdToCount.size() == 1 || (EQUAL(osFeatureType, "profile") &&
                                           oMapDimIdToCount.size() == 2 &&
                                           nProfileDimId >= 0)) )
     {
         anPotentialVectorVarID.resize(0);
-        *pnVars = 0;
+    }
+    else
+    {
+        *pnRasterVars += nRasterVars;
     }
 
     if( !anPotentialVectorVarID.empty() && bKeepVectors )
@@ -10642,7 +10646,8 @@ CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
     for( int i = 0; i < nSubGroups; i++ )
     {
         FilterVars(panSubGroupIds[i], bKeepRasters, bKeepVectors,
-                   papszIgnoreVars, pnVars, pnGroupId, pnVarId, pnIgnoredVars);
+                   papszIgnoreVars, pnRasterVars, pnGroupId, pnVarId,
+                   pnIgnoredVars);
     }
     CPLFree(panSubGroupIds);
 

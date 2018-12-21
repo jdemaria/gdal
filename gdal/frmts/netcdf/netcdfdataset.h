@@ -880,7 +880,7 @@ class netCDFDataset final: public GDALPamDataset
     bool GrowDim(int nLayerId, int nDimIdToGrow, size_t nNewSize);
 
     CPLErr FilterVars( int nCdfId, bool bKeepRasters, bool bKeepVectors,
-                       char **papszIgnoreVars, int *pnVars,
+                       char **papszIgnoreVars, int *pnRasterVars,
                        int *pnGroupId, int *pnVarId, int *pnIgnoredVars );
     CPLErr CreateGrpVectorLayers( int nCdfId, CPLString osFeatureType,
                                   std::vector<int> anPotentialVectorVarID,
