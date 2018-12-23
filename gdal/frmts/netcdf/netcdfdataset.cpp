@@ -2255,7 +2255,7 @@ void netCDFDataset::SetProjectionFromVar( int nGroupId, int nVarId,
         return;
     }
 
-    // Look for grid_mapping metadata. 
+    // Look for grid_mapping metadata.
     const char *pszValue = FetchAttr(nGroupId, nVarId, CF_GRD_MAPPING);
     char *szGridMappingValue = CPLStrdup(pszValue ? pszValue : "");
 
@@ -6983,7 +6983,7 @@ GDALDataset *netCDFDataset::Open( GDALOpenInfo *poOpenInfo )
             nGroupID = cdfid;
 
         char *pszVarName = nullptr;
-        NCDF_ERR(NCDFGetVarFullName(nGroupID, nVarID, &pszVarName, true));
+        NCDF_ERR(NCDFGetVarFullName(nGroupID, nVarID, &pszVarName));
         osSubdatasetName = (pszVarName != nullptr ? pszVarName : "");
         CPLFree(pszVarName);
     }
@@ -10251,7 +10251,6 @@ static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
                                   char **ppszFullName, bool bNC3Compat )
 {
     *ppszFullName = nullptr;
-
     char *pszGroupFullName = nullptr;
     ERR_RET(NCDFGetGroupFullName(nGroupId, &pszGroupFullName, bNC3Compat));
     char szVarName[NC_MAX_NAME + 1];
@@ -10271,7 +10270,6 @@ static CPLErr NCDFGetVarFullName( int nGroupId, int nVarId,
     const char *pszSep = "/";
     if( EQUAL(pszGroupFullName, "/") || EQUAL(pszGroupFullName, "") )
         pszSep = "";
-
     *ppszFullName = CPLStrdup(CPLSPrintf("%s%s%s", pszGroupFullName, pszSep,
                                          szVarName));
     CPLFree(pszGroupFullName);
@@ -10561,6 +10559,7 @@ CPLErr netCDFDataset::FilterVars( int nCdfId, bool bKeepRasters,
                 }
                 if( bKeepRasters )
                 {
+                    *pnGroupId = nCdfId;
                     *pnVarId = v;
                     nRasterVars++;
                 }
